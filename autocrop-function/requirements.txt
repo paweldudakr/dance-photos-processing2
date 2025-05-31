@@ -4,3 +4,12 @@ Pillow>=9.0.0,<11.0.0
 piexif>=1.1.3,<2.0.0 
 ultralytics>=8.0.0 # Dla YOLOv8
 # torch i torchvision zostaną zainstalowane jako zależności ultralytics
+mediapipe
+scikit-learn
+easyocr
+opencv-python
+tqdm
+# numpy i scipy są zwykle zależnościami innych pakietów (np. scikit-learn, opencv),
+# ale można je dodać jawnie, jeśli są bezpośrednio używane i chcesz kontrolować wersje.
+numpy
+scipy
