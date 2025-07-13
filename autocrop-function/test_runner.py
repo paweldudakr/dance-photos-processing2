@@ -1,9 +1,16 @@
 import os
 import types
 import glob # Do wyszukiwania plików pasujących do wzorca
-from main import _do_actual_processing # Importuj funkcję wewnętrzną z main.py
+from main import _do_actual_processing, initialize_models # Importuj funkcję wewnętrzną z main.py
 from PIL import Image # Do wczytania EXIF lokalnie
 import piexif 
+from ultralytics import YOLO
+
+# Will be initialized in main() to allow for potential model wnload messages
+YOLO_MODEL = None
+SELFIE_SEGMENTER = None
+EASYOCR_READER = None
+DEFAULT_PALETTE_NAME = "default_palette.json"
 
 if __name__ == "__main__":
     # 1. Uwierzytelnianie (jeśli potrzebne dla Vision AI, nawet przy lokalnym pliku)
@@ -28,6 +35,10 @@ if __name__ == "__main__":
     if not os.path.isdir(input_image_directory):
         print(f"BŁĄD: Podana ścieżka wejściowa nie jest katalogiem lub nie istnieje: {input_image_directory}")
         exit()
+
+    # Loads and initializes all the required AI models.
+    # This function should be called once at the start of the application.
+    initialize_models()
 
     # Wyszukaj pliki obrazów (np. jpg, png) w podanym katalogu
     # Możesz dodać więcej rozszerzeń w razie potrzeby

@@ -13,6 +13,7 @@ import easyocr
 import piexif
 from tqdm import tqdm
 import warnings
+from io import BytesIO
 
 
 # Suppress specific warnings if necessary (e.g., from KMeans or other libraries)
@@ -20,11 +21,50 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.cluste
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.activation")
 
 # --- Global Initializations ---
-# Will be initialized in main() to allow for potential model wnload messages
+# Will be initialized by initialize_models() to allow for potential model download messages
 YOLO_MODEL = None
 SELFIE_SEGMENTER = None
 EASYOCR_READER = None
 DEFAULT_PALETTE_NAME = "default_palette.json"
+
+
+def initialize_models():
+    """
+    Loads and initializes all the required AI models.
+    This function should be called once at the start of the application.
+    """
+    global YOLO_MODEL, SELFIE_SEGMENTER, EASYOCR_READER
+    print("INFO: Initializing AI models...")
+    try:
+        # 1. Initialize YOLO model
+        # Using yolov8n-seg.pt for person detection and segmentation
+        if not YOLO_MODEL:
+            print("  - Loading YOLOv8 model (yolov8n-seg.pt)...")
+            YOLO_MODEL = YOLO('yolov8n-seg.pt')
+            print("  - YOLO model loaded successfully.")
+
+        # 2. Initialize MediaPipe Selfie Segmenter
+        if not SELFIE_SEGMENTER:
+            print("  - Loading MediaPipe Selfie Segmentation model...")
+            SELFIE_SEGMENTER = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1) # 0 for general, 1 for landscape
+            print("  - MediaPipe model loaded successfully.")
+
+        # 3. Initialize EasyOCR Reader
+        if not EASYOCR_READER:
+            print("  - Loading EasyOCR model (for English)...")
+            # Specify the languages you want to recognize, e.g., ['en']
+            EASYOCR_READER = easyocr.Reader(['en'], gpu=False) # Set gpu=True if you have a compatible GPU and CUDA setup
+            print("  - EasyOCR model loaded successfully.")
+        
+        print("INFO: All models initialized successfully.")
+        return True
+
+    except Exception as e:
+        print(f"CRITICAL: Failed to initialize one or more models: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 # --- Color Utility Functions ---
 def hex_to_rgb(hex_str):
@@ -379,117 +419,256 @@ def process_image(image_path, palette_lab_map, palette_names_list):
 
     return result_data
 
+def people_detection(yolo_detections_filtered, image_rgb_full_np, img_h, img_w):
+    print("Detection & Segmentation Pipeline (YOLOv8n-seg)")
 
-def _do_actual_processing(image_bytes_original, original_file_name):
-    global YOLO_MODEL, SELFIE_SEGMENTER, EASYOCR_READER # Declare use of global vars
-
-    parser = argparse.ArgumentParser(description="Process ballroom dance photos to extract metadata.")
-    parser.add_argument("input_dir", help="Directory containing input images.")
-    parser.add_argument("--palette", help="Path to a custom JSON color palette file (RGB hex or list values). If not provided, uses default_palette.json (LAB values).")
-    args = parser.parse_args()
-
-    print("Initializing models...")
-    try:
-        YOLO_MODEL = YOLO('yolov8n-seg.pt') # Segmentation model for person masks
-        print("  YOLOv8n-seg model loaded.")
-    except Exception as e:
-        print(f"Error loading YOLO model: {e}. Person detection/segmentation will be skipped.")
-        YOLO_MODEL = None
-        
-    try:
-        SELFIE_SEGMENTER = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=0)
-        print("  MediaPipe SelfieSegmentation model loaded.")
-    except Exception as e:
-        print(f"Error loading MediaPipe SelfieSegmentation model: {e}. Hair segmentation will be skipped.")
-        SELFIE_SEGMENTER = None
-
-    try:
-        EASYOCR_READER = easyocr.Reader(['en'], gpu=False) # gpu=False for wider compatibility, can be True if GPU available
-        print("  EasyOCR reader loaded.")
-    except Exception as e:
-        print(f"Error loading EasyOCR reader: {e}. Bib number recognition will be skipped.")
-        EASYOCR_READER = None
+    yolo_results = YOLO_MODEL(image_rgb_full_np, verbose=False)
     
-    print("Loading color palette...")
-    palette_lab_map, palette_names_list = load_palette("default_palette.json")
+    # Check if there are any results and if the results contain boxes and masks
+    if not yolo_results or yolo_results[0].boxes is None or yolo_results[0].masks is None:
+        print("  Warning: YOLO did not return any detections or masks. Skipping.")
+        return yolo_detections_filtered
+
+    person_class_id = 0  # Person class in COCO
+    
+    # Get masks data once
+    masks_data = yolo_results[0].masks.data.cpu().numpy()
+    
+    # Iterate through each detected box in a more robust way
+    for i, box in enumerate(yolo_results[0].boxes):
+        # box object contains class, confidence, and coordinates
+        if int(box.cls) == person_class_id:
+            # Extract bounding box coordinates
+            bbox_coords = box.xyxy[0].cpu().numpy().astype(int)
+            x1, y1, x2, y2 = bbox_coords
+            
+            # The mask for this detection corresponds to its index 'i'
+            if i < len(masks_data):
+                # Resize individual mask to original image dimensions
+                segmentation_mask_resized = cv2.resize(masks_data[i], (img_w, img_h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+                
+                yolo_detections_filtered.append({
+                    "bbox": tuple(bbox_coords),
+                    "mask": segmentation_mask_resized,
+                    "area": (x2 - x1) * (y2 - y1),
+                    "confidence": float(box.conf)
+                })
+            else:
+                print(f"  Warning: Mismatch between number of boxes and masks. Skipping mask for detection {i}.")
+
+    print("Detected " + str(len(yolo_detections_filtered)) + " person(s) with YOLOv8n-seg.")
+    return yolo_detections_filtered
+
+
+def identify_main_dancer(yolo_detections_filtered, image_bgr_full_np, original_filename, main_dancer_details = None, bib_number_val = "UNREADABLE"):
+    print("Identify Main Dancer (largest person bbox with a visible digit-only start number)")
+
+    if yolo_detections_filtered and EASYOCR_READER:
+        print("get_main_dancer_info was defined in response #22 / #24") 
+        main_dancer_details = get_main_dancer_info(yolo_detections_filtered, image_bgr_full_np, EASYOCR_READER)
+        if main_dancer_details:
+            bib_number_val = main_dancer_details.get("bib_number", "UNREADABLE")
+            print(f"  INFO: Główny tancerz zidentyfikowany dla {original_filename}. Numer: {bib_number_val} (Pewność: {main_dancer_details.get('bib_confidence',0):.2f})")
+        else:
+            print(f"  INFO: Główny tancerz nie mógł zostać zidentyfikowany (brak czytelnego numeru) w {original_filename}.")
+    elif not EASYOCR_READER and yolo_detections_filtered:
+         print(f"  OSTRZEŻENIE: Czytnik EasyOCR niedostępny. Nie można zidentyfikować głównego tancerza na podstawie numeru dla {original_filename}.")
+         # Fallback: if no OCR, define main dancer as simply the largest person detected by YOLO
+         if yolo_detections_filtered:
+            largest_person = max(yolo_detections_filtered, key=lambda p: p['area'])
+            main_dancer_details = largest_person # Will not have 'bib_number' or 'bib_confidence' from OCR
+            print(f"  INFO: Używam największej osoby jako głównego tancerza (bez potwierdzenia numeru startowego) dla {original_filename}.")
+    
+    return main_dancer_details, bib_number_val
+
+
+# ... (Keep global model initializations: YOLO_MODEL, SELFIE_SEGMENTER, EASYOCR_READER) ...
+# ... (Keep color utility functions: hex_to_rgb, rgb_to_lab, load_palette, extract_dominant_color) ...
+# ... (Keep detection helper functions: get_main_dancer_info, get_hair_region_mask from response #22 or #24) ...
+# Ensure these helper functions (get_main_dancer_info, get_hair_region_mask, extract_dominant_color)
+# correctly use the global YOLO_MODEL, SELFIE_SEGMENTER, EASYOCR_READER.
+
+def _do_actual_processing(image_bytes_input, original_filename, palette_lab_map="", palette_names_list=""):
+    """
+    Processes a single image (from bytes) according to the detailed requirements:
+    (1) dominant dress color of the main dancer,
+    (2) hair color of all visible people, and
+    (3) the contestant start-number.
+
+    Args:
+        image_bytes_input: Bytes of the original image.
+        original_filename: Original name of the file (for logging and output JSON).
+        palette_lab_map: Dictionary mapping color names to their LAB values.
+        palette_names_list: List of color names corresponding to palette_lab_map.
+
+    Returns:
+        A tuple: (result_json_data, processed_image_bytes_with_exif)
+        result_json_data: A dictionary with the extracted metadata.
+        processed_image_bytes_with_exif: Bytes of the image with new EXIF, or None if processing failed.
+    """
+    print(f"INFO: _do_actual_processing starting for: {original_filename}")
+    # Access global models; they should be initialized when main.py is imported/run.
+    global YOLO_MODEL, SELFIE_SEGMENTER, EASYOCR_READER
+
+    # Loads and initializes all the required AI models.
+    # This function should be called once at the start of the application.
+    global YOLO_MODEL, SELFIE_SEGMENTER, EASYOCR_READER
+    print("INFO: Initializing AI models...")
+
+    if not YOLO_MODEL:
+        initialize_models()
+
+    if not YOLO_MODEL: # EasyOCR can sometimes be optional if bib number is not critical for all images
+        print(f"  KRYTYCZNY BŁĄD (_do_actual_processing): Model YOLO nie jest załadowany dla {original_filename}. Przerywam przetwarzanie tego pliku.")
+        return {"file": original_filename, "error": "YOLO model not loaded"}, None
+    
+    print("INFO: Ładowanie palety kolorów dla test_runner...")
+    palette_lab_map, palette_names_list = load_palette("palette.json")
     if not palette_names_list:
-        print("CRITICAL: Color palette could not be loaded. Dominant color extraction will fail.")
-        # Optionally, exit or provide a minimal fallback palette here
-        # For now, extract_dominant_color will return "Unknown"
+        print("BŁĄD KRYTYCZNY: Nie udało się załadować palety kolorów w test_runner. Zatrzymuję.")
+        exit()
 
-    image_extensions = ('*.jpg', '*.jpeg', '*.png')
-    image_paths = []
-    for ext in image_extensions:
-        image_paths.extend(glob.glob(os.path.join(args.input_dir, ext)))
-        image_paths.extend(glob.glob(os.path.join(args.input_dir, ext.upper())))
-    
-    if not image_paths:
-        print(f"No images found in {args.input_dir}")
-        return
-
-    print(f"Found {len(image_paths)} images to process.")
-    all_results = []
-    for img_path in tqdm(image_paths, desc="Processing images"):
-        print(f"\nProcessing: {img_path}")
-        result = process_image(img_path, palette_lab_map, palette_names_list)
-        if result:
-            print(json.dumps(result)) # Print JSON line for each image
-            all_results.append(result)
-    
-    # Optionally, save all results to a single JSON file
-    # output_summary_file = os.path.join(args.input_dir, "processing_summary.json")
-    # with open(output_summary_file, 'w') as f_summary:
-    #     json.dump(all_results, f_summary, indent=2)
-    # print(f"\nSummary saved to {output_summary_file}")
-
-    if SELFIE_SEGMENTER:
-        SELFIE_SEGMENTER.close() # Clean up MediaPipe model
-
-
-# --- Główna Funkcja Cloud Function (Entry Point) ---
-# Definicja process_image_crop_and_metadata(event, context) pozostaje taka sama jak w poprzedniej odpowiedzi,
-# wywołuje _do_actual_processing.
-# Skopiuj tutaj pełną definicję tej funkcji z poprzedniej odpowiedzi.
-def process_image_crop_and_metadata(event, context):
-    bucket_name = event['bucket']
-    file_name = event['name']
-    print(f"Otrzymano zdarzenie dla pliku: {file_name} z bucketu: {bucket_name} (ID: {context.event_id})")
-
-    source_bucket = storage_client.bucket(bucket_name)
-    source_blob = source_bucket.blob(file_name)
-    
-    try:
-        image_bytes_original = source_blob.download_as_bytes()
-        original_content_type = source_blob.content_type 
-        print(f"Pobrano plik {file_name} ({len(image_bytes_original)} bajtów) z GCS.")
-    except Exception as e:
-        print(f"Błąd podczas pobierania obrazu {file_name} z GCS: {e}")
-        return 
-
-    processed_image_bytes, save_format = _do_actual_processing(image_bytes_original, file_name)
-
-    if not processed_image_bytes:
-        print(f"Przetwarzanie obrazu {file_name} nie powiodło się. Nic nie zostanie zapisane.")
-        return
-
-    project_id = os.environ.get('GCP_PROJECT', None)
-    if not project_id:
-        if os.environ.get("FUNCTIONS_EMULATOR") == "true":
-             project_id = "pdudaphotos-local-test" 
-        else: 
-            project_id = "pdudaphotos" 
-            print(f"OSTRZEŻENIE: Zmienna środowiskowa GCP_PROJECT nie jest ustawiona. Używam domyślnego '{project_id}'.")
-    
-    target_bucket_name = f"{project_id}-cropped-photos" 
-    base, ext = os.path.splitext(file_name)
-    target_blob_name = f"processed_yolo_{base}.{save_format.lower()}" # Zmieniona nazwa dla odróżnienia
-
-    target_bucket = storage_client.bucket(target_bucket_name)
-    target_blob = target_bucket.blob(target_blob_name)
+    if not palette_lab_map or not palette_names_list:
+        print(f"  KRYTYCZNY BŁĄD (_do_actual_processing): Paleta kolorów niezaładowana dla {original_filename}. Przerywam przetwarzanie tego pliku.")
+        return {"file": original_filename, "error": "Color palette not loaded"}, None
 
     try:
-        upload_content_type = f'image/{save_format.lower()}' if save_format else original_content_type
-        target_blob.upload_from_string(processed_image_bytes, content_type=upload_content_type)
-        print(f"Przetworzony obraz ({len(processed_image_bytes)} bajtów) zapisany jako: gs://{target_bucket_name}/{target_blob_name}")
+        img_pil = Image.open(BytesIO(image_bytes_input)).convert('RGB')
+        image_rgb_full_np = np.array(img_pil)
+        # For EasyOCR and some OpenCV operations, BGR might be preferred or default
+        image_bgr_full_np = cv2.cvtColor(image_rgb_full_np, cv2.COLOR_RGB2BGR)
+        img_h, img_w = image_rgb_full_np.shape[:2]
+        original_exif_bytes = img_pil.info.get('exif', b'')
+        print(f"Obraz {original_filename} załadowany z bajtów. Format: {img_pil.format}, Rozmiar: {img_w}x{img_h}")
     except Exception as e:
-        print(f"Błąd podczas zapisywania przetworzonego obrazu {target_blob_name} do GCS: {e}")
+        print(f"  BŁĄD: Nie udało się załadować obrazu {original_filename} z bajtów: {e}")
+        return {"file": original_filename, "error": f"Image loading failed: {e}"}, None
+
+    yolo_detections_filtered = []
+    yolo_detections_filtered = people_detection(yolo_detections_filtered, image_rgb_full_np, img_h, img_w)
+
+    main_dancer_details = None
+    bib_number_val = "UNREADABLE"
+    main_dancer_details, bib_number_val = identify_main_dancer(yolo_detections_filtered, image_bgr_full_np, original_filename, main_dancer_details, bib_number_val)
+
+    print("Dominant Dress Color of the Main Dancer")
+    main_dancer_dress_color = "Unknown"
+    if main_dancer_details:
+        md_bbox = main_dancer_details["bbox"]      # (x1, y1, x2, y2)
+        md_yolo_seg_mask = main_dancer_details["mask"] # Numpy array (img_h, img_w) mask for this person
+
+        # Define dress region: use person segmentation mask, exclude head/arms (top 35% of bbox)
+        bbox_h = md_bbox[3] - md_bbox[1]
+        
+        # Create a boolean mask that is False for the head/arms exclusion zone
+        # This mask is on the full image coordinates
+        head_arms_exclusion_mask = np.ones_like(md_yolo_seg_mask, dtype=bool)
+        exclusion_zone_y_end = md_bbox[1] + int(0.35 * bbox_h)
+        
+        # Set rows in the exclusion zone within the person's horizontal span to False
+        # This ensures we only consider the lower part of the person, using their segmentation mask
+        head_arms_exclusion_mask[md_bbox[1]:exclusion_zone_y_end, md_bbox[0]:md_bbox[2]] = False
+        
+        # Dress mask is the person's segmentation AND NOT the head/arms exclusion zone
+        # More accurately: person's segmentation MASKED BY (where clothing_area_within_bbox is True)
+        # We want pixels that are part of the person (md_yolo_seg_mask > 0)
+        # AND are in the lower 65% of their bounding box.
+        
+        # Create a general "clothing area" mask based on bbox percentages
+        clothing_area_mask = np.zeros_like(md_yolo_seg_mask, dtype=np.uint8)
+        clothing_y_start = md_bbox[1] + int(0.35 * bbox_h) # Start below head/arms
+        clothing_y_end = md_bbox[3] # To bottom of person
+        clothing_x_start = md_bbox[0]
+        clothing_x_end = md_bbox[2]
+
+        if clothing_y_start < clothing_y_end and clothing_x_start < clothing_x_end:
+            clothing_area_mask[clothing_y_start:clothing_y_end, clothing_x_start:clothing_x_end] = 1
+        
+        # Final dress mask: intersection of person's segmentation and the defined clothing area
+        dress_mask_final = np.where((md_yolo_seg_mask > 0) & (clothing_area_mask > 0), 1, 0).astype(np.uint8)
+
+        if np.sum(dress_mask_final) > 0:
+            # extract_dominant_color was defined in response #22 / #24
+            main_dancer_dress_color = extract_dominant_color(image_rgb_full_np, dress_mask_final, palette_lab_map, palette_names_list)
+            print(f"  INFO: Kolor sukni głównego tancerza ({original_filename}): {main_dancer_dress_color}")
+        else:
+            main_dancer_dress_color = "Unknown (pusta maska sukni)"
+            print(f"  INFO: Maska sukni głównego tancerza była pusta dla {original_filename}.")
+    else:
+        main_dancer_dress_color = "Unknown (brak głównego tancerza)"
+
+
+    print("Hair Color of All Visible People")
+    all_hair_colors = []
+    if yolo_detections_filtered: # Iterate through all people detected by YOLO
+        if SELFIE_SEGMENTER:
+            for i, person_det in enumerate(yolo_detections_filtered):
+                print("get_hair_region_mask was defined in response #22 / #24")
+                # get_hair_region_mask was defined in response #22 / #24
+                hair_mask = get_hair_region_mask(person_det["bbox"], image_rgb_full_np, SELFIE_SEGMENTER)
+                if hair_mask is not None and np.sum(hair_mask) > 0:
+                    hair_color = extract_dominant_color(image_rgb_full_np, hair_mask, palette_lab_map, palette_names_list)
+                    all_hair_colors.append(hair_color)
+                else:
+                    all_hair_colors.append("Unknown (brak maski włosów)")
+            print(f"  INFO: Wykryte kolory włosów dla {original_filename}: {all_hair_colors}")
+        else:
+            all_hair_colors = ["Unknown (SelfieSegmenter niedostępny)"] * len(yolo_detections_filtered)
+            print(f"  OSTRZEŻENIE: SelfieSegmenter niedostępny, pomijanie detekcji koloru włosów dla {original_filename}.")
+    else: # No people detected by YOLO
+        all_hair_colors.append("Unknown (brak osób)")
+
+
+    print("Prepare Output") 
+    result_data_json = {
+        "file": original_filename,
+        "dress_color": main_dancer_dress_color,
+        "hair_colors": all_hair_colors if all_hair_colors else ["Unknown"], # Ensure list is not empty for JSON
+        "bib_number": bib_number_val
+    }
+
+    print("Prepare modified EXIF bytes")
+    # Prepare EXIF data to be inserted into the image
+    modified_exif_bytes = original_exif_bytes 
+    try:
+        exif_dict = piexif.load(original_exif_bytes) if original_exif_bytes else \
+                    {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+        
+        user_comment_str = json.dumps(result_data_json, ensure_ascii=False)
+        if "Exif" not in exif_dict: exif_dict["Exif"] = {}
+        exif_dict["Exif"][piexif.ExifIFD.UserComment] = b'UNDEFINED\x00' + user_comment_str.encode('utf-8', 'replace')
+        
+        description_str = f"Dress: {main_dancer_dress_color}, Bib: {bib_number_val}, Hairs: {';'.join(all_hair_colors)}"
+        if "0th" not in exif_dict: exif_dict["0th"] = {}
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description_str.encode('utf-8', 'replace')
+        
+        modified_exif_bytes = piexif.dump(exif_dict)
+        # print(f"  INFO: Metadane EXIF przygotowane dla {original_filename}") # Already printed by caller in test_runner
+    except Exception as e:
+        print(f"  OSTRZEŻENIE: Błąd podczas przygotowywania EXIF dla {original_filename}: {e}.")
+        # modified_exif_bytes remains original_exif_bytes
+
+    print("Save the image (PIL object) with new EXIF to an in-memory byte stream")  
+    output_image_stream = BytesIO()
+    final_processed_image_bytes = None
+    try:
+        save_image_format = img_pil.format if img_pil.format and img_pil.format.upper() in ['JPEG', 'PNG'] else 'JPEG'
+        
+        if save_image_format.upper() != 'JPEG' and modified_exif_bytes != original_exif_bytes:
+            print(f"  OSTRZEŻENIE: Zapisuję jako JPEG (zamiast {save_image_format}) aby zachować zmodyfikowane dane EXIF dla {original_filename}.")
+            save_image_format = 'JPEG'
+
+        img_pil.save(output_image_stream, format=save_image_format, exif=modified_exif_bytes)
+        final_processed_image_bytes = output_image_stream.getvalue()
+        print(f"Obraz {original_filename} ({save_image_format}) przygotowany w pamięci z nowymi EXIF.")
+    except Exception as e:
+        print(f"  BŁĄD: Nie udało się zapisać obrazu {original_filename} z nowymi EXIF do strumienia: {e}")
+        try:
+            print(f"Próba zapisu {original_filename} bez danych EXIF (po błędzie).")
+            output_image_stream_no_exif = BytesIO()
+            img_pil.save(output_image_stream_no_exif, format=img_pil.format or 'JPEG')
+            final_processed_image_bytes = output_image_stream_no_exif.getvalue()
+        except Exception as e_fallback:
+            print(f"  BŁĄD KRYTYCZNY: Nie udało się zapisać obrazu {original_filename} nawet bez EXIF: {e_fallback}")
+            
+    return result_data_json, final_processed_image_bytes
