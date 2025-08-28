@@ -513,14 +513,20 @@ def _do_actual_processing(image_bytes_input, original_filename, palette_lab_map=
     # Loads and initializes all the required AI models.
     # This function should be called once at the start of the application.
     global YOLO_MODEL, SELFIE_SEGMENTER, EASYOCR_READER
-    print("INFO: Initializing AI models...")
 
-    if not YOLO_MODEL:
+    # Ta procedura zabezpieczająca zapewnia, że wszystkie krytyczne modele są załadowane.
+    if not YOLO_MODEL or not EASYOCR_READER:
+        print("INFO: Jeden lub więcej krytycznych modeli nie jest załadowany. Próba inicjalizacji...")
         initialize_models()
 
-    if not YOLO_MODEL: # EasyOCR can sometimes be optional if bib number is not critical for all images
+    # Po próbie inicjalizacji, wykonaj ostateczne sprawdzenie.
+    if not YOLO_MODEL: 
         print(f"  KRYTYCZNY BŁĄD (_do_actual_processing): Model YOLO nie jest załadowany dla {original_filename}. Przerywam przetwarzanie tego pliku.")
-        return {"file": original_filename, "error": "YOLO model not loaded"}, None
+        return {"file": original_filename, "error": "YOLO model not loaded"}, None, None
+    
+    if not EASYOCR_READER:
+        print(f"  KRYTYCZNY BŁĄD (_do_actual_processing): Model EasyOCR nie jest załadowany dla {original_filename}. Nie można odczytać numeru startowego.")
+        return {"file": original_filename, "error": "EasyOCR model not loaded"}, None, None
     
     print("INFO: Ładowanie palety kolorów dla test_runner...")
     palette_lab_map, palette_names_list = load_palette("palette.json")
@@ -530,7 +536,7 @@ def _do_actual_processing(image_bytes_input, original_filename, palette_lab_map=
 
     if not palette_lab_map or not palette_names_list:
         print(f"  KRYTYCZNY BŁĄD (_do_actual_processing): Paleta kolorów niezaładowana dla {original_filename}. Przerywam przetwarzanie tego pliku.")
-        return {"file": original_filename, "error": "Color palette not loaded"}, None
+        return {"file": original_filename, "error": "Color palette not loaded"}, None, None
 
     try:
         img_pil = Image.open(BytesIO(image_bytes_input)).convert('RGB')
@@ -542,7 +548,7 @@ def _do_actual_processing(image_bytes_input, original_filename, palette_lab_map=
         print(f"Obraz {original_filename} załadowany z bajtów. Format: {img_pil.format}, Rozmiar: {img_w}x{img_h}")
     except Exception as e:
         print(f"  BŁĄD: Nie udało się załadować obrazu {original_filename} z bajtów: {e}")
-        return {"file": original_filename, "error": f"Image loading failed: {e}"}, None
+        return {"file": original_filename, "error": f"Image loading failed: {e}"}, None, None
 
     yolo_detections_filtered = []
     yolo_detections_filtered = people_detection(yolo_detections_filtered, image_rgb_full_np, img_h, img_w)
@@ -566,7 +572,6 @@ def _do_actual_processing(image_bytes_input, original_filename, palette_lab_map=
         exclusion_zone_y_end = md_bbox[1] + int(0.35 * bbox_h)
         
         # Set rows in the exclusion zone within the person's horizontal span to False
-        # This ensures we only consider the lower part of the person, using their segmentation mask
         head_arms_exclusion_mask[md_bbox[1]:exclusion_zone_y_end, md_bbox[0]:md_bbox[2]] = False
         
         # Dress mask is the person's segmentation AND NOT the head/arms exclusion zone
@@ -651,6 +656,7 @@ def _do_actual_processing(image_bytes_input, original_filename, palette_lab_map=
     print("Save the image (PIL object) with new EXIF to an in-memory byte stream")  
     output_image_stream = BytesIO()
     final_processed_image_bytes = None
+    save_image_format = None
     try:
         save_image_format = img_pil.format if img_pil.format and img_pil.format.upper() in ['JPEG', 'PNG'] else 'JPEG'
         
@@ -671,4 +677,4 @@ def _do_actual_processing(image_bytes_input, original_filename, palette_lab_map=
         except Exception as e_fallback:
             print(f"  BŁĄD KRYTYCZNY: Nie udało się zapisać obrazu {original_filename} nawet bez EXIF: {e_fallback}")
             
-    return result_data_json, final_processed_image_bytes
+    return result_data_json, final_processed_image_bytes, save_image_format

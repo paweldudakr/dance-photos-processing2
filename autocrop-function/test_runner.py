@@ -1,4 +1,44 @@
 import os
+import sys
+import subprocess
+import re
+from importlib import metadata
+
+def check_and_install_dependencies():
+    """
+    Sprawdza, czy zależności z requirements.txt są zainstalowane,
+    i instaluje brakujące.
+    """
+    requirements_path = 'requirements.txt'
+    if not os.path.exists(requirements_path):
+        print(f"OSTRZEŻENIE: Nie znaleziono pliku {requirements_path}. Nie można zweryfikować zależności.")
+        return
+
+    print("INFO: Sprawdzanie zależności...")
+    with open(requirements_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            # Wyodrębnij nazwę pakietu z linii (np. 'Pillow' z 'Pillow>=9.0.0')
+            package_name = re.split(r'[<>=!~]', line)[0].strip()
+            
+            try:
+                metadata.distribution(package_name)
+                # print(f"  - {package_name} jest zainstalowany.")
+            except metadata.PackageNotFoundError:
+                print(f"  - Zależność '{package_name}' nie jest zainstalowana. Instalowanie...")
+                try:
+                    # Używamy oryginalnej linii, aby zachować wersje
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", line])
+                    print(f"  - Pomyślnie zainstalowano '{line}'.")
+                except subprocess.CalledProcessError as e:
+                    print(f"  - BŁĄD: Nie udało się zainstalować '{line}'. Błąd: {e}")
+                    print("  - Proszę zainstalować zależności ręcznie, uruchamiając: pip install -r requirements.txt")
+                    sys.exit(1) # Zakończ program, jeśli instalacja się nie powiedzie
+
+# ...istniejące importy...
 import types
 import glob # Do wyszukiwania plików pasujących do wzorca
 from main import _do_actual_processing, initialize_models # Importuj funkcję wewnętrzną z main.py
@@ -13,6 +53,9 @@ EASYOCR_READER = None
 DEFAULT_PALETTE_NAME = "default_palette.json"
 
 if __name__ == "__main__":
+    # Sprawdź i zainstaluj zależności na samym początku
+    check_and_install_dependencies()
+
     # 1. Uwierzytelnianie (jeśli potrzebne dla Vision AI, nawet przy lokalnym pliku)
     # Jeśli używasz 'gcloud auth application-default login', to jest obsługiwane.
     # os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "C:\\sciezka\\do\\twojego\\klucza.json"
@@ -63,14 +106,13 @@ if __name__ == "__main__":
             with open(local_image_path, 'rb') as f:
                 image_bytes_input = f.read()
 
-            # Wywołaj główną logikę przetwarzania
-            # (Funkcja _do_actual_processing jest w main.py)
-            processed_image_bytes, save_format = _do_actual_processing(image_bytes_input, original_file_name)
+            # Wywołaj główną funkcję przetwarzającą
+            processed_data, processed_image_bytes, save_format = _do_actual_processing(image_bytes_input, original_file_name)
 
-            if processed_image_bytes:
+            # Sprawdź, czy przetwarzanie się powiodło i zwróciło obraz oraz format
+            if processed_image_bytes and save_format:
                 # Zapisz przetworzony obraz lokalnie do weryfikacji
-                base, input_ext = os.path.splitext(original_file_name)
-                # Użyj formatu zwróconego przez funkcję przetwarzającą
+                base, _ = os.path.splitext(original_file_name)
                 output_file_name = f"processed_local_{base}.{save_format.lower()}"
                 output_path = os.path.join(output_folder, output_file_name)
                 
@@ -78,7 +120,7 @@ if __name__ == "__main__":
                     f_out.write(processed_image_bytes)
                 print(f"Przetworzony obraz zapisano jako: {output_path}")
                 
-                # Opcjonalnie: sprawdź EXIF zapisanego pliku, jeśli to JPEG
+                # Opcjonalnie: sprawdź EXIF zapisanego pliku
                 if save_format.upper() == 'JPEG':
                     try:
                         img_with_exif = Image.open(output_path)
@@ -99,14 +141,18 @@ if __name__ == "__main__":
 
                     except Exception as e_exif:
                         print(f"Nie udało się odczytać/zinterpretować EXIF z {output_file_name}: {e_exif}")
+
+            # Obsłuż błędy zgłoszone przez funkcję
+            elif processed_data and processed_data.get("error"):
+                print(f"KRYTYCZNY BŁĄD podczas przetwarzania pliku {original_file_name}: {processed_data.get('error')}")
             else:
-                print(f"Przetwarzanie obrazu {original_file_name} nie zwróciło danych (błąd w _do_actual_processing).")
+                print(f"KRYTYCZNY BŁĄD podczas przetwarzania pliku {original_file_name}: funkcja nie zwróciła obrazu.")
 
         except FileNotFoundError:
-            print(f"BŁĄD: Nie znaleziono pliku {local_image_path}. Pomijanie.")
+            print(f"BŁĄD: Nie znaleziono pliku: {local_image_path}")
         except Exception as e:
             print(f"KRYTYCZNY BŁĄD podczas przetwarzania pliku {original_file_name}: {e}")
             import traceback
-            traceback.print_exc() # Wydrukuje pełny ślad stosu błędu
-    
-    print("\n--- Zakończono przetwarzanie wszystkich plików z katalogu. ---")
+            traceback.print_exc()
+
+    print("\nZakończono przetwarzanie wszystkich plików.")
