@@ -223,10 +223,10 @@ def get_main_dancer_info(yolo_person_detections, image_cv_rgb, vision_client):
                     current_person_best_bib_text = cleaned_text
                     break
 
-        if current_person_best_bib_text:
-            if area > largest_area:
-                largest_area = area
-                main_dancer_candidate = det
+        if area > largest_area:
+            largest_area = area
+            main_dancer_candidate = det
+            if current_person_best_bib_text:
                 best_bib_info = {"text": current_person_best_bib_text, "confidence": 0.9}
 
     if main_dancer_candidate:
