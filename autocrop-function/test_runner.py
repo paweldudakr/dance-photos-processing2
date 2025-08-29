@@ -50,7 +50,7 @@ from ultralytics import YOLO
 YOLO_MODEL = None
 SELFIE_SEGMENTER = None
 EASYOCR_READER = None
-DEFAULT_PALETTE_NAME = "palette.json"
+DEFAULT_PALETTE_NAME = "default_palette.json"
 
 if __name__ == "__main__":
     # Sprawdź i zainstaluj zależności na samym początku
