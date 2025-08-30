@@ -4,284 +4,202 @@ import json
 import os
 import cv2
 import numpy as np
-from PIL import Image, ExifTags
-from ultralytics import YOLO
-import mediapipe as mp
-from sklearn.cluster import KMeans
-from scipy.spatial.distance import cdist
-from google.cloud import vision
+from PIL import Image, ExifTags, ImageOps
 import piexif
 from tqdm import tqdm
 import warnings
 from io import BytesIO
-
+import google.generativeai as genai
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.cluster._kmeans")
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.activation")
 
 # --- Global Initializations ---
-YOLO_MODEL = None
-SELFIE_SEGMENTER = None
-VISION_CLIENT = None
+GEMINI_API_KEY_CONFIGURED = False
 
 def initialize_models():
     """
-    Loads and initializes all the required AI models.
+    Checks for the Gemini API key.
     """
-    global YOLO_MODEL, SELFIE_SEGMENTER, VISION_CLIENT
-    print("INFO: Initializing AI models...")
-    try:
-        if not YOLO_MODEL:
-            print("  - Loading YOLOv8 model...")
-            YOLO_MODEL = YOLO('yolov8n-seg.pt')
-        if not SELFIE_SEGMENTER:
-            print("  - Loading MediaPipe Selfie Segmentation model...")
-            SELFIE_SEGMENTER = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
-        if not VISION_CLIENT:
-            print("  - Initializing Google Cloud Vision client...")
-            VISION_CLIENT = vision.ImageAnnotatorClient()
-        print("INFO: All models initialized successfully.")
+    global GEMINI_API_KEY_CONFIGURED
+    print("INFO: Checking for Gemini API key...")
+    if os.environ.get("GEMINI_API_KEY"):
+        print("INFO: Gemini API key found in environment variables.")
+        GEMINI_API_KEY_CONFIGURED = True
         return True
-    except Exception as e:
-        print(f"CRITICAL: Failed to initialize one or more models: {e}")
+    else:
+        print("CRITICAL: GEMINI_API_KEY environment variable not set.")
+        print("Please get your API key from Google AI Studio (https://aistudio.google.com/app/apikey) and set it.")
+        GEMINI_API_KEY_CONFIGURED = False
         return False
 
 # --- Utility Functions ---
-def calculate_iou(box_a, box_b):
-    x_a = max(box_a[0], box_b[0])
-    y_a = max(box_a[1], box_b[1])
-    x_b = min(box_a[2], box_b[2])
-    y_b = min(box_a[3], box_b[3])
-    inter_area = max(0, x_b - x_a) * max(0, y_b - y_a)
-    box_a_area = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    box_b_area = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-    denominator = float(box_a_area + box_b_area - inter_area)
-    return inter_area / denominator if denominator > 0 else 0
-
-def hex_to_rgb(hex_str):
-    hex_str = hex_str.lstrip('#')
-    return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
-
-def rgb_to_lab(rgb_tuple):
-    rgb_np = np.uint8([[rgb_tuple]])
-    return cv2.cvtColor(rgb_np, cv2.COLOR_RGB2LAB)[0][0].astype(float)
-
-def find_closest_color(lab_color, palette_lab_map, palette_names_list, ignore_lightness=False):
-    if not palette_names_list:
-        return "UnknownPaletteEmpty"
-    palette_lab_values = np.array(list(palette_lab_map.values()))
-    if ignore_lightness:
-        distances = cdist([lab_color[1:]], palette_lab_values[:, 1:])
-    else:
-        distances = cdist([lab_color], palette_lab_values)
-    return palette_names_list[np.argmin(distances)]
-
-def load_palette(palette_path):
-    palette_data_lab = {}
-    palette_names = []
+def load_palette_names(palette_path):
     try:
         with open(palette_path, 'r') as f:
             palette_data = json.load(f)
-        for name, color_val in palette_data.items():
-            palette_names.append(name)
-            if isinstance(color_val, str):
-                palette_data_lab[name] = rgb_to_lab(hex_to_rgb(color_val))
-            elif isinstance(color_val, list) and len(color_val) == 3:
-                palette_data_lab[name] = np.array(color_val, dtype=float)
         print(f"Loaded palette from: {palette_path}")
-        return palette_data_lab, palette_names
+        return list(palette_data.keys())
     except Exception as e:
         print(f"CRITICAL: Could not load palette '{palette_path}': {e}")
-        return {}, []
-
-# --- Core Processing Functions ---
-
-def get_professional_crop(person_detections, img_w, img_h, target_aspect_ratio=3/2):
-    if not person_detections:
-        return None
-    sorted_detections = sorted(person_detections, key=lambda p: p['area'], reverse=True)
-    subjects = sorted_detections[:2] if len(sorted_detections) >= 2 else sorted_detections[:1]
-    min_x = min(s['bbox'][0] for s in subjects)
-    min_y = min(s['bbox'][1] for s in subjects)
-    max_x = max(s['bbox'][2] for s in subjects)
-    max_y = max(s['bbox'][3] for s in subjects)
-    box_w, box_h = max_x - min_x, max_y - min_y
-    center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
-    padded_w, padded_h = box_w * 1.5, box_h * 1.7
-    if padded_w / padded_h > target_aspect_ratio:
-        new_h = padded_w / target_aspect_ratio
-        new_w = padded_w
-    else:
-        new_w = padded_h * target_aspect_ratio
-        new_h = padded_h
-    crop_x1, crop_y1 = int(center_x - new_w / 2), int(center_y - new_h / 2)
-    crop_x2, crop_y2 = int(center_x + new_w / 2), int(center_y + new_h / 2)
-    crop_x1, crop_y1 = max(0, crop_x1), max(0, crop_y1)
-    crop_x2, crop_y2 = min(img_w, crop_x2), min(img_h, crop_y2)
-    return (crop_x1, crop_y1, crop_x2, crop_y2)
-
-def localize_objects(image_rgb_full_np, vision_client):
-    print("INFO: Starting object localization using Google Vision API...")
-    try:
-        success, encoded_image = cv2.imencode('.jpg', cv2.cvtColor(image_rgb_full_np, cv2.COLOR_RGB2BGR))
-        content = encoded_image.tobytes()
-        gcv_image = vision.Image(content=content)
-        response = vision_client.object_localization(image=gcv_image)
-        return response.localized_object_annotations
-    except Exception as e:
-        print(f"  ERROR: Google Vision API object_localization call failed: {e}")
         return []
 
-def get_color_from_vision_api(target_bbox, all_objects, object_names, image_rgb_full_np, vision_client, palette_lab_map, palette_names_list, ignore_lightness=False):
-    if not target_bbox:
-        return "Unknown (no target)"
-    relevant_objects = [obj for obj in all_objects if obj.name in object_names]
-    if not relevant_objects:
-        return f"Unknown (no {object_names[0]} detected)"
-
-    img_h, img_w = image_rgb_full_np.shape[:2]
+# --- Core Processing Functions ---
+def analyze_image_with_gemini(image_bytes, dress_palette_names, hair_palette_names):
+    """
+    Analyzes the image using the Gemini API to extract dancer info and a recommended crop.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("ERROR: Gemini API key not found.")
+        return None
     
-    def get_obj_bbox(obj):
-        verts = obj.bounding_poly.normalized_vertices
-        return (int(verts[0].x * img_w), int(verts[0].y * img_h), int(verts[2].x * img_w), int(verts[2].y * img_h))
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-pro-latest')
+    
+    image_part = {"mime_type": "image/jpeg", "data": image_bytes}
+    
+    prompt = f"""
+Analyze the attached image of dancers. Your task is to identify the two largest people, their clothing/hair colors, and recommend a professional crop.
 
-    best_match_obj = max(relevant_objects, key=lambda obj: calculate_iou(target_bbox, get_obj_bbox(obj)), default=None)
+The available dress colors are: {dress_palette_names}.
+The available hair colors are: {hair_palette_names}.
 
-    if not best_match_obj:
-        return f"Unknown (no matching {object_names[0]})"
+Additionally, recommend a professional crop for this image. The crop should follow aesthetic principles like the Rule of Thirds, focus on the main subjects, and have a standard aspect ratio of approximately 3:2.
 
-    x1, y1, x2, y2 = get_obj_bbox(best_match_obj)
-    if x1 >= x2 or y1 >= y2:
-        return "Unknown (invalid bbox)"
+Respond with a single, valid JSON object only, with no other text or markdown formatting. The JSON object should have the following structure:
 
-    cropped_np = image_rgb_full_np[y1:y2, x1:x2]
+{{
+  "people": [
+    {{
+      "is_main_dancer": true,
+      "dress_color": "<color_from_dress_palette>",
+      "hair_color": "<color_from_hair_palette>",
+      "bounding_box": {{ "x1": <float>, "y1": <float>, "x2": <float>, "y2": <float> }}
+    }}
+  ],
+  "recommended_crop": {{ "x1": <float>, "y1": <float>, "x2": <float>, "y2": <float> }}
+}}
 
+All coordinates must be normalized to the range [0.0, 1.0]. The origin (0,0) is the top-left corner. The first person in the list should be the largest/main dancer. If you cannot identify any people, respond with an empty JSON object {{}}.
+"""
+    
     try:
-        success, encoded_image = cv2.imencode('.jpg', cv2.cvtColor(cropped_np, cv2.COLOR_RGB2BGR))
-        content = encoded_image.tobytes()
-        response = vision_client.image_properties(image=vision.Image(content=content))
-        dominant_color = max(response.image_properties_annotation.dominant_colors.colors, key=lambda c: c.pixel_fraction)
-        rgb_tuple = (dominant_color.color.red, dominant_color.color.green, dominant_color.color.blue)
-        dominant_lab_color = rgb_to_lab(rgb_tuple)
-        return find_closest_color(dominant_lab_color, palette_lab_map, palette_names_list, ignore_lightness)
+        print("INFO: Sending request to Gemini API...")
+        response = model.generate_content([prompt, image_part])
+        
+        response_text = response.text.strip()
+        json_start = response_text.find('{')
+        json_end = response_text.rfind('}') + 1
+        if json_start == -1 or json_end == 0:
+            print(f"ERROR: No JSON object found in Gemini response: {response_text}")
+            return None
+            
+        json_string = response_text[json_start:json_end]
+        
+        print(f"INFO: Received response from Gemini: {json_string}")
+        return json.loads(json_string)
+        
     except Exception as e:
-        print(f"  ERROR: Vision API image_properties call failed: {e}")
-        return "Unknown (Vision API error)"
+        print(f"ERROR: Gemini API call failed: {e}")
+        return None
 
 def _do_actual_processing(image_bytes_input, original_filename):
     print(f"INFO: Processing: {original_filename}")
-    if not all([YOLO_MODEL, VISION_CLIENT, SELFIE_SEGMENTER]):
-        initialize_models()
+    if not GEMINI_API_KEY_CONFIGURED:
+        if not initialize_models():
+            return {"file": original_filename, "error": "Gemini API key not configured"}, None, None
 
-    dress_palette_lab, dress_palette_names = load_palette("autocrop-function/default_palette.json")
-    hair_palette_lab, hair_palette_names = load_palette("autocrop-function/hair_palette.json")
+    dress_palette_names = load_palette_names("autocrop-function/default_palette.json")
+    hair_palette_names = load_palette_names("autocrop-function/hair_palette.json")
 
     try:
-        img_pil = Image.open(BytesIO(image_bytes_input)).convert('RGB')
-        image_rgb_full_np = np.array(img_pil)
+        img_pil_original = Image.open(BytesIO(image_bytes_input))
+        original_exif_bytes = img_pil_original.info.get('exif', b'')
+
+        print("INFO: Normalizing image orientation based on EXIF data...")
+        img_pil = ImageOps.exif_transpose(img_pil_original)
+        
+        image_rgb_full_np = np.array(img_pil.convert('RGB'))
         img_h, img_w = image_rgb_full_np.shape[:2]
-        original_exif_bytes = img_pil.info.get('exif', b'')
+        print(f"INFO: Source image resolution (after orientation correction): {img_w}x{img_h}")
+        
+        buffer = BytesIO()
+        img_pil.save(buffer, format="JPEG")
+        normalized_image_bytes = buffer.getvalue()
+
     except Exception as e:
         return {"file": original_filename, "error": f"Image loading failed: {e}"}, None, None
 
-    all_objects = localize_objects(image_rgb_full_np, VISION_CLIENT)
-    person_detections = []
-    for obj in [o for o in all_objects if o.name == 'Person']:
-        verts = obj.bounding_poly.normalized_vertices
-        bbox = (int(verts[0].x * img_w), int(verts[0].y * img_h), int(verts[2].x * img_w), int(verts[2].y * img_h))
-        person_detections.append({"bbox": bbox, "area": (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])})
+    gemini_result = analyze_image_with_gemini(normalized_image_bytes, dress_palette_names, hair_palette_names)
 
-    sorted_persons = sorted(person_detections, key=lambda p: p['area'], reverse=True)
-    top_two_persons = sorted_persons[:2]
-
-    main_dancer_details = top_two_persons[0] if top_two_persons else None
     main_dancer_dress_color = "Unknown"
-    if main_dancer_details:
-        main_dancer_dress_color = get_color_from_vision_api(main_dancer_details['bbox'], all_objects, ["Dress", "Skirt", "Clothing"], image_rgb_full_np, VISION_CLIENT, dress_palette_lab, dress_palette_names, ignore_lightness=True)
-
     all_hair_colors = []
-    for person in top_two_persons:
-        hair_color = get_color_from_vision_api(person['bbox'], all_objects, ["Hair"], image_rgb_full_np, VISION_CLIENT, hair_palette_lab, hair_palette_names, ignore_lightness=True)
-        all_hair_colors.append(hair_color)
+    main_dancer_bbox = None
 
-    # Final Image Generation
-    image_with_boxes = image_rgb_full_np.copy()
+    if gemini_result and "people" in gemini_result and gemini_result["people"]:
+        people_data = gemini_result["people"]
+        for person_data in people_data:
+            bbox_data = person_data.get("bounding_box", {})
+            # Convert normalized coordinates to pixels
+            x1 = int(bbox_data.get("x1", 0) * img_w)
+            y1 = int(bbox_data.get("y1", 0) * img_h)
+            x2 = int(bbox_data.get("x2", 0) * img_w)
+            y2 = int(bbox_data.get("y2", 0) * img_h)
+            bbox = (x1, y1, x2, y2)
+
+            all_hair_colors.append(person_data.get("hair_color", "Unknown"))
+            if person_data.get("is_main_dancer"):
+                main_dancer_dress_color = person_data.get("dress_color", "Unknown")
+                main_dancer_bbox = bbox
     
-    for person_det in top_two_persons:
-        x1, y1, x2, y2 = person_det['bbox']
-        cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (0, 0, 255), 3) # Blue box
-
-    if main_dancer_details:
-        x1, y1, x2, y2 = main_dancer_details['bbox']
-        cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 6) # Thicker green box
-
+    # Final Image Generation & EXIF
+    image_with_boxes = image_rgb_full_np.copy()
+    if main_dancer_bbox:
+        x1, y1, x2, y2 = main_dancer_bbox
+        cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 6)
         hair_info = all_hair_colors[0] if all_hair_colors else "Unknown"
         info_text = f"Dress: {main_dancer_dress_color}, Hair: {hair_info}"
-        
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1.2
-        font_color = (255, 255, 255)
-        thickness = 2
-        text_y = y1 - 15 if y1 > 40 else y2 + 40
-        
-        (text_width, text_height), _ = cv2.getTextSize(info_text, font, font_scale, thickness)
-        cv2.rectangle(image_with_boxes, (x1, text_y - text_height - 10), (x1 + text_width + 10, text_y + 5), (0,0,0), -1)
-        cv2.putText(image_with_boxes, info_text, (x1 + 5, text_y - 5), font, font_scale, font_color, thickness)
+        cv2.putText(image_with_boxes, info_text, (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,0), 3, cv2.LINE_AA)
+        cv2.putText(image_with_boxes, info_text, (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
 
-    img_pil = Image.fromarray(image_with_boxes)
-    print(f"INFO: Calculating professional crop for source image size {img_w}x{img_h}...")
-    crop_coords = get_professional_crop(top_two_persons, img_w, img_h)
-    if crop_coords:
-        print(f"  - Applying crop with coordinates: {crop_coords}")
-        img_pil = img_pil.crop(crop_coords)
+    img_pil_to_crop = Image.fromarray(image_with_boxes)
+    
+    crop_data = gemini_result.get("recommended_crop") if gemini_result else None
+    if crop_data:
+        # Convert normalized coordinates to pixels
+        x1 = int(crop_data.get("x1", 0) * img_w)
+        y1 = int(crop_data.get("y1", 0) * img_h)
+        x2 = int(crop_data.get("x2", 0) * img_w)
+        y2 = int(crop_data.get("y2", 0) * img_h)
+        crop_coords = (x1, y1, x2, y2)
+        
+        print(f"INFO: Applying Gemini's recommended crop: {crop_coords}")
+        final_img_pil = img_pil_to_crop.crop(crop_coords)
     else:
-        print("  - No people detected or invalid crop, skipping crop.")
+        print("WARNING: Gemini did not return a recommended crop. Image will not be cropped.")
+        final_img_pil = img_pil_to_crop
 
-    # EXIF Data
-    result_data_json = {
-        "file": original_filename,
-        "dress_color": main_dancer_dress_color,
-        "hair_colors": all_hair_colors if all_hair_colors else ["Unknown"],
-        "bib_number": "N/A"
-    }
+    result_data_json = {"file": original_filename, "dress_color": main_dancer_dress_color, "hair_colors": all_hair_colors, "bib_number": "N/A"}
     modified_exif_bytes = original_exif_bytes
     try:
-        print("INFO: Attempting to modify EXIF data...")
         exif_dict = piexif.load(original_exif_bytes)
-        
-        if "GPS" in exif_dict:
-            del exif_dict["GPS"]
-            print("  - Removed GPS data from EXIF to prevent corruption.")
+        if "GPS" in exif_dict: del exif_dict["GPS"]
+        if piexif.ImageIFD.Orientation in exif_dict["0th"]:
+            del exif_dict["0th"][piexif.ImageIFD.Orientation]
+            print("  - Removed Orientation tag from EXIF after applying it.")
 
-        # Write full JSON data to UserComment (for machines)
-        user_comment_str = json.dumps(result_data_json, ensure_ascii=False)
-        exif_dict["Exif"][piexif.ExifIFD.UserComment] = b'UNDEFINED\x00' + user_comment_str.encode('utf-8', 'replace')
-
-        # Write human-readable summary to ImageDescription (for apps like Microsoft Photos)
-        description_str = f"Dress: {main_dancer_dress_color}, Hair: {",".join(all_hair_colors)}"
-        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description_str.encode("utf-8")
-
+        exif_dict["Exif"][piexif.ExifIFD.UserComment] = json.dumps(result_data_json, ensure_ascii=False).encode("utf-8")
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = f"Dress: {main_dancer_dress_color}, Hair: {",".join(all_hair_colors)}".encode("utf-8")
         modified_exif_bytes = piexif.dump(exif_dict)
-        print("  - EXIF data successfully prepared for both UserComment and ImageDescription.")
     except Exception as e:
-        print(f"  WARNING: Could not modify EXIF data due to error: {e}. Original EXIF will be used.")
-        modified_exif_bytes = original_exif_bytes
+        print(f"  WARNING: Could not modify EXIF data: {e}.")
 
-    # Save Image
     output_image_stream = BytesIO()
     try:
-        print("INFO: Saving image to memory stream...")
-        img_pil.save(output_image_stream, format='JPEG', exif=modified_exif_bytes)
-        print("  - Image saved successfully with EXIF data.")
+        final_img_pil.save(output_image_stream, format='JPEG', exif=modified_exif_bytes)
         return result_data_json, output_image_stream.getvalue(), 'JPEG'
     except Exception as e:
-        print(f"  CRITICAL ERROR: Failed to save image with EXIF: {e}")
-        try:
-            print("  - Last resort: attempting to save image without any EXIF data.")
-            output_image_stream_no_exif = BytesIO()
-            img_pil.save(output_image_stream_no_exif, format='JPEG')
-            return result_data_json, output_image_stream_no_exif.getvalue(), 'JPEG'
-        except Exception as e_final:
-            print(f"  FATAL: Could not save image even without EXIF: {e_final}")
-            return result_data_json, None, None
+        print(f"  CRITICAL ERROR: Failed to save image: {e}")
+        return result_data_json, None, None
